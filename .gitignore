@@ -1,6 +1,7 @@
 # Data files
-data/
 btc_blocks_pruned_1GiB.tar.gz
+data/blocks/
+data/prices/
 
 # local settings
 .vscode/
