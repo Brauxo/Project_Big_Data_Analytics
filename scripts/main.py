@@ -16,6 +16,10 @@ from pyspark.ml.classification import LogisticRegression, GBTClassifier
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 import csv
+import yaml 
+from pathlib import Path
+from io import StringIO
+
 
 class BlockchainParser:
     def __init__(self, raw_data):
@@ -132,6 +136,7 @@ def parse_raw_block_file(file_data):
             
     return blocks
 
+
 def create_spark_session():
     """Creates and returns a Spark Session."""
     spark = SparkSession.builder \
@@ -140,6 +145,18 @@ def create_spark_session():
         .config("spark.driver.memory", "4g") \
         .getOrCreate()
     return spark
+
+def load_config():
+    """
+    Loads the YAML configuration file by building a reliable path
+    relative to the script's location.
+    """
+    script_dir = Path(__file__).parent.resolve()
+    project_root = script_dir.parent
+    config_path = project_root / "bda_project_config.yml"
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
 
 def generate_environment_file(spark, output_path):
     """Generates the ENV.md file documenting the execution environment."""
@@ -172,7 +189,6 @@ def generate_environment_file(spark, output_path):
     env_file_path = Path(output_path)
     env_file_path.write_text("\n".join(env_lines) + "\n", encoding='utf-8')
     print(f"Environment details saved to {env_file_path.resolve()}")
-    return env_file_path.resolve()
 
 
 def run_etl(spark, input_path, output_path):
@@ -334,12 +350,12 @@ def run_feature_engineering(spark, transactions_path, prices_path, output_path):
         "tx_volume_btc"
     ).sort("timestamp_utc", ascending=False).show(15)
 
+    save_explain_plan(df_combined, "explain_plan_features.txt")
     df_combined.write.mode("overwrite").parquet(output_path)
     print("Saving in parquet format Done !")
-
     print("--- Feature Engineering Stage Complete ---")
 
-def run_modeling(spark, features_path, metrics_path):
+def run_modeling(spark, features_path, metrics_path, params):
     """
     Runs the model training and evaluation.
     (Content from notebook 04-Modeling-and-Evaluation.ipynb)
@@ -353,8 +369,8 @@ def run_modeling(spark, features_path, metrics_path):
     df_ml.show(5)
 
     # Define the prediction horizon and threshold
-    prediction_horizon = 10  # in minutes
-    price_increase_threshold = 0.001  # 0.1%
+    prediction_horizon = params['prediction_horizon_minutes']
+    price_increase_threshold = params['price_increase_threshold']
 
     # Use a Window function to get the future price
     window_spec = Window.orderBy("timestamp_utc")
@@ -379,7 +395,8 @@ def run_modeling(spark, features_path, metrics_path):
     df_final_ml.groupBy("label").count().show()
 
     # Additional feature engineering: rolling averages and momentum indicators
-    rolling_window_1h = Window.orderBy("timestamp_utc").rowsBetween(-60, 0)
+    rolling_window_rows = params['rolling_window_hours'] * 60
+    rolling_window_1h = Window.orderBy("timestamp_utc").rowsBetween(-rolling_window_rows, 0)
 
     df_with_features = df_final_ml.withColumn(
         # Price momentum 
@@ -418,7 +435,10 @@ def run_modeling(spark, features_path, metrics_path):
     ]
 
     # 2. Split the data for training and test
-    (training_data, test_data) = df_with_features.randomSplit([0.8, 0.2], seed=42)
+    (training_data, test_data) = df_with_features.randomSplit(
+        [1.0 - params['test_size'], params['test_size']], 
+        seed=params['random_seed']
+    )
     print("Data split into training and testing sets :")
     print(f" - Training set count: {training_data.count():,}")
     print(f" - Test set count: {test_data.count():,}")
@@ -448,6 +468,7 @@ def run_modeling(spark, features_path, metrics_path):
 
     # Sample of prediction
     predictions.select("timestamp_utc", "price_close", "label", "prediction", "probability").show()
+    save_explain_plan(predictions, "explain_plan_predictions.txt")
 
     # Evaluate the model suing ROC
     evaluator = BinaryClassificationEvaluator(
@@ -461,7 +482,7 @@ def run_modeling(spark, features_path, metrics_path):
     print(f"Area Under ROC Curve (AUC) = {auc:.4f}")
 
     metrics_file = metrics_path
-    run_id = "gbt_with_rolling_features_run_01" 
+    run_id = params['run_id'] 
     timestamp = datetime.now().isoformat()
 
     metrics_to_log = [
@@ -483,23 +504,32 @@ def run_modeling(spark, features_path, metrics_path):
 
     print("--- Modeling Stage Complete ---")
 
+def save_explain_plan(df, filename):
+    """Saves the formatted explain plan of a DataFrame to a text file."""
+    script_dir = Path(__file__).parent.resolve()
+    project_root = script_dir.parent
+    evidence_dir = project_root / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    output_path = evidence_dir / filename
+    old_stdout = sys.stdout
+    sys.stdout = explain_buffer = StringIO()
+    df.explain("formatted")
+    sys.stdout = old_stdout
+    with open(output_path, 'w') as f:
+        f.write(explain_buffer.getvalue())
+    print(f"Saved explain plan to {output_path}")
 
 if __name__ == "__main__":
+    config = load_config()
     spark = create_spark_session()
-    
-    # Define paths
-    ENV_OUTPUT_PATH = "../ENV.md"
-    RAW_BLOCKS_PATH = "../data/blocks/blocks/blk*.dat"
-    TRANSACTIONS_OUTPUT_PATH = "../data/processed/transactions.parquet"
-    PRICES_PATH = "../data/prices/btcusd_1-min_data.csv"
-    FEATURES_OUTPUT_PATH = "../data/processed/features.parquet"
-    METRICS_OUTPUT_PATH = "../project_metrics_log.csv"
+    paths = config['paths']
+    params = config['modeling']
 
     # Run the pipeline step-by-step
-    generate_environment_file(spark, ENV_OUTPUT_PATH)
-    run_etl(spark, RAW_BLOCKS_PATH, TRANSACTIONS_OUTPUT_PATH)
-    run_feature_engineering(spark, TRANSACTIONS_OUTPUT_PATH, PRICES_PATH, FEATURES_OUTPUT_PATH)
-    run_modeling(spark, FEATURES_OUTPUT_PATH, METRICS_OUTPUT_PATH)
+    generate_environment_file(spark, paths['env_file'])
+    run_etl(spark, paths['raw_blocks'], paths['transactions_parquet'])
+    run_feature_engineering(spark, paths['transactions_parquet'], paths['market_prices'], paths['features_parquet'])
+    run_modeling(spark, paths['features_parquet'], paths['metrics_log'], params)
 
     spark.stop()
     print("--- Pipeline Finished ---")
