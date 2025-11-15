@@ -1,5 +1,7 @@
 # Evidence
 
+by BRAUX Owen and CAMBIER Elliot
+
 This directory contains artifacts that provide evidence of the project's execution and adherence to the requirements, specifically focusing on the use of Apache Spark.
 
 ## Contents
