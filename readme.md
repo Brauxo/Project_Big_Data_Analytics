@@ -1,5 +1,7 @@
 # Big Data
 
+by BRAUX Owen and CAMBIER Elliot
+
 conda create -n bda-env python=3.10 -y
 conda activate bda-env
 conda install -c conda-forge openjdk=21 maven -y
